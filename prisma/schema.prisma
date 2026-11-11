@@ -1,0 +1,299 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+// L'URL de connexion est lue dans prisma.config.js (DATABASE_URL)
+datasource db {
+  provider = "postgresql"
+}
+
+// null sur User.profileStatus = profil colocataire pas encore rempli
+enum ProfileStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  SUSPENDED
+  BANNED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum GenderPreference {
+  SAME_ONLY
+  ANY
+}
+
+enum Situation {
+  HAS_HOUSING // "J'ai déjà un logement et je cherche un coloc"
+  SEEKING // "Je cherche un coloc pour louer ensemble"
+}
+
+enum HousingType {
+  ENTREE_COUCHEE
+  CHAMBRE_SALON
+  DEUX_CHAMBRES_SALON
+  TROIS_CHAMBRES_SALON
+  STUDIO
+  AUTRE
+}
+
+enum StudyYear {
+  L1
+  L2
+  L3
+  M1
+  M2
+  DOCTORAT
+  AUTRE
+}
+
+enum StudyTime {
+  DAY
+  NIGHT
+  FLEXIBLE
+}
+
+enum GuestsFrequency {
+  NEVER
+  RARELY
+  SOMETIMES
+  OFTEN
+}
+
+enum IdDocumentType {
+  CIP
+  CNI
+}
+
+enum RequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  CANCELLED
+}
+
+enum ReportReason {
+  AGENT // agent ou démarcheur
+  SCAM // arnaque ou demande d'argent
+  FAKE_PROFILE
+  INAPPROPRIATE
+  OTHER
+}
+
+enum ReportStatus {
+  OPEN
+  RESOLVED
+  DISMISSED
+}
+
+enum AdminActionType {
+  APPROVE_PROFILE
+  REJECT_PROFILE
+  SUSPEND_USER
+  BAN_USER
+  RESTORE_USER
+  RESOLVE_REPORT
+  DISMISS_REPORT
+}
+
+enum BannedIdentityKind {
+  GOOGLE_SUB
+  EMAIL
+  WHATSAPP
+}
+
+model User {
+  id              String    @id @default(cuid())
+  googleSub       String    @unique
+  email           String    @unique
+  googleFirstName String?
+  /// Format international (+22901XXXXXXXX). Non vérifié au MVP.
+  whatsapp        String?   @unique
+  termsAcceptedAt DateTime?
+
+  profileStatus   ProfileStatus?
+  /// Motif du rejet, affiché à l'utilisateur pour qu'il corrige son profil
+  rejectionReason String?
+  /// Motif de la suspension ou du bannissement (interne)
+  sanctionReason  String?
+  approvedAt      DateTime?
+  /// Date du dernier passage en attente : ordre de la file de validation
+  profileSubmittedAt DateTime?
+
+  // Vérification d'identité : colonnes prévues dès la V1, remplies en V2
+  idDocumentType     IdDocumentType?
+  idDocumentUrl      String?
+  studentCardUrl     String?
+  selfieUrl          String?
+  /// Empreinte HMAC du NPI, jamais le NPI en clair
+  npiHash            String?         @unique
+  whatsappVerifiedAt DateTime?
+  identityVerifiedAt DateTime?
+
+  lastLoginAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  profile           Profile?
+  sentRequests      ConnectionRequest[] @relation("RequestSender")
+  receivedRequests  ConnectionRequest[] @relation("RequestReceiver")
+  reportsMade       Report[]            @relation("ReportReporter")
+  reportsReceived   Report[]            @relation("ReportReported")
+  pushSubscriptions PushSubscription[]
+  adminActions      AdminAction[]       @relation("AdminActionAdmin")
+  actionsReceived   AdminAction[]       @relation("AdminActionTarget")
+  bannedIdentities  BannedIdentity[]
+
+  @@index([profileStatus, profileSubmittedAt])
+}
+
+model Profile {
+  userId String @id
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  firstName    String
+  /// URL de la photo (hébergée ailleurs), pas de fichier stocké par l'API
+  photoUrl     String
+  age          Int
+  gender       Gender
+  isStudent    Boolean    @default(true)
+  university   String?
+  campus       String?
+  fieldOfStudy String?
+  studyYear    StudyYear?
+
+  situation Situation
+
+  // Renseignés seulement si situation = HAS_HOUSING
+  housingNeighborhood  String?
+  housingType          HousingType?
+  housingTotalRent     Int?
+  housingShareAsked    Int?
+  housingAvailableFrom DateTime?    @db.Date
+
+  /// Budget maximum pour sa part du loyer, en FCFA (situation = SEEKING)
+  maxBudget              Int?
+  /// Identifiants de quartiers (voir config/constants.js)
+  preferredNeighborhoods String[]
+  genderPreference       GenderPreference
+
+  // Rythme de vie : sert au score de compatibilité
+  wakeTime        String // "HH:MM"
+  sleepTime       String // "HH:MM"
+  studyTime       StudyTime
+  guestsFrequency GuestsFrequency
+  cleanliness     Int // 1 (très détendu) à 5 (très exigeant)
+  smoker          Boolean
+
+  bio String?
+
+  /// false une fois la coloc confirmée : le profil sort de la recherche
+  searching Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([searching, gender])
+}
+
+model ConnectionRequest {
+  id         String        @id @default(cuid())
+  senderId   String
+  sender     User          @relation("RequestSender", fields: [senderId], references: [id], onDelete: Cascade)
+  receiverId String
+  receiver   User          @relation("RequestReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+  message    String?
+  status     RequestStatus @default(PENDING)
+
+  respondedAt DateTime?
+
+  // Relance "Vous êtes en coloc ?" 7 jours après l'acceptation
+  followUpSentAt  DateTime?
+  senderInColoc   Boolean?
+  receiverInColoc Boolean?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  colocation Colocation?
+
+  @@index([senderId, createdAt])
+  @@index([receiverId, status])
+  @@index([status, respondedAt])
+}
+
+/// Coloc confirmée par les deux étudiants. Les liens passent à null si un compte
+/// est supprimé, pour que le compteur du tableau de bord reste juste.
+model Colocation {
+  id          String             @id @default(cuid())
+  requestId   String?            @unique
+  request     ConnectionRequest? @relation(fields: [requestId], references: [id], onDelete: SetNull)
+  userAId     String?
+  userBId     String?
+  confirmedAt DateTime           @default(now())
+}
+
+model Report {
+  id         String       @id @default(cuid())
+  reporterId String
+  reporter   User         @relation("ReportReporter", fields: [reporterId], references: [id], onDelete: Cascade)
+  reportedId String
+  reported   User         @relation("ReportReported", fields: [reportedId], references: [id], onDelete: Cascade)
+  reason     ReportReason
+  details    String?
+  status     ReportStatus @default(OPEN)
+
+  resolvedAt     DateTime?
+  resolutionNote String?
+
+  createdAt DateTime @default(now())
+
+  @@index([status, createdAt])
+  @@index([reportedId])
+  @@index([reporterId, reportedId])
+}
+
+/// Journal des actions admin : qui a validé, rejeté, banni, et quand
+model AdminAction {
+  id           String          @id @default(cuid())
+  adminId      String?
+  admin        User?           @relation("AdminActionAdmin", fields: [adminId], references: [id], onDelete: SetNull)
+  action       AdminActionType
+  targetUserId String?
+  targetUser   User?           @relation("AdminActionTarget", fields: [targetUserId], references: [id], onDelete: SetNull)
+  reportId     String?
+  reason       String?
+  createdAt    DateTime        @default(now())
+
+  @@index([createdAt])
+  @@index([targetUserId])
+}
+
+/// Empreintes (HMAC) des identifiants bannis. Elles survivent à la suppression
+/// du compte : un banni ne peut pas se réinscrire, sans qu'on garde ses données.
+model BannedIdentity {
+  id        String             @id @default(cuid())
+  kind      BannedIdentityKind
+  hash      String
+  userId    String?
+  user      User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt DateTime           @default(now())
+
+  @@unique([kind, hash])
+  @@index([userId])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
